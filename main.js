@@ -1,4 +1,10 @@
 import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import { WorkletSynthesizer } from "spessasynth_lib";
+
+// Tone filter range (Hz). Centre is nearly open so the samples keep their natural brightness.
+const FILTER_MIN_HZ = 700;
+const FILTER_CENTER_HZ = 8000;
+const FILTER_MAX_HZ = 16000;
 
 // ---- DOM references ----
 const videoEl = document.getElementById("webcam");
@@ -436,11 +442,8 @@ let currentKeyName =
 });
 
 const toneSelectEl = document.getElementById("toneSelect");
-let currentWaveform = toneSelectEl.value;
-
 toneSelectEl.addEventListener("change", () => {
-  currentWaveform = toneSelectEl.value;
-  synth.currentKey = null; // forces sound refresh
+  synth.setProgram(toneSelectEl.value);
 });
 
 function getDegreeFreq(degree) {
@@ -574,108 +577,126 @@ function getSolidNotes(tones, rightHandCount, isMajorMode) {
   }
 }
 
-// ---- Synth engine: oscillators -> lowpass filter -> master volume ----
+// ---- Synth engine: SoundFont (sampled instruments) -> lowpass filter -> master volume ----
+const SOUND_FONT_URL = "/sound/FluidR3Mono_GM.sf3";
+const PROCESSOR_URL = "/spessasynth_processor.min.js";
+const MIDI_CHANNEL = 0;
+const NOTE_VELOCITY = 100;
+
+const freqToMidi = (f) => Math.round(69 + 12 * Math.log2(f / 440));
+
 class SynthEngine {
   constructor() {
     this.ctx = null;
+    this.player = null; // spessasynth WorkletSynthesizer
     this.filter = null;
-    this.waveShaper = null;
     this.masterGain = null;
-    this.oscillators = [];
+    this.heldNotes = [];
     this.currentKey = null;
+    this.loading = null;
   }
 
+  // Must be called from a user gesture (click) so the AudioContext may start.
   ensureContext() {
-    if (this.ctx) return;
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.loading) return this.loading;
+    this.loading = this._init();
+    return this.loading;
+  }
 
-    this.waveShaper = this.ctx.createWaveShaper();
-    this.waveShaper.curve = null;
-    this.waveShaper.oversample = "4x"; // Reduces aliasing harshness
+  async _init() {
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
 
     this.filter = this.ctx.createBiquadFilter();
     this.filter.type = "lowpass";
-    this.filter.frequency.value = 1200;
+    this.filter.frequency.value = FILTER_CENTER_HZ;
     this.filter.Q.value = 0.7;
 
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 0;
 
-    // Signal chain: oscillators -> waveshaper -> filter -> masterGain -> output
-    this.waveShaper.connect(this.filter);
+    // Signal chain: sampler -> filter -> masterGain -> output
     this.filter.connect(this.masterGain);
     this.masterGain.connect(this.ctx.destination);
+
+    await this.ctx.audioWorklet.addModule(PROCESSOR_URL);
+    this.player = new WorkletSynthesizer(this.ctx);
+    this.player.connect(this.filter);
+
+    const res = await fetch(SOUND_FONT_URL);
+    if (!res.ok) throw new Error("Could not load " + SOUND_FONT_URL);
+    await this.player.soundBankManager.addSoundBank(await res.arrayBuffer(), "main");
+    await this.player.isReady;
+    this.setProgram(toneSelectEl.value);
   }
 
-  updateVolume(volume01) {
-    if (!this.ctx) return;
-    // Smooth gain transitions to prevent audio clicking
-    this.masterGain.gain.setTargetAtTime(volume01, this.ctx.currentTime, 0.03);
+  get ready() {
+    return !!this.player;
   }
+
+  setProgram(program) {
+    if (!this.player) return;
+    this.releaseNotes();
+    this.player.programChange(MIDI_CHANNEL, Number(program));
+  }
+
+  releaseNotes() {
+    if (!this.player) return;
+    this.heldNotes.forEach((n) => this.player.noteOff(MIDI_CHANNEL, n));
+    this.heldNotes = [];
+    this.currentKey = null;
+  }
+
   setVolume(volume01) {
-    if (!this.ctx) return;
+    if (!this.ctx || !this.masterGain) return;
     const clamped = Math.max(0, Math.min(1, volume01));
     this.masterGain.gain.linearRampToValueAtTime(clamped, this.ctx.currentTime + 0.05);
+    // Hand gone: let the notes ring out and release, so the next chord is a fresh strike.
+    if (clamped < 0.01 && this.heldNotes.length) this.releaseNotes();
   }
 
+  // Tilt moves the lowpass: inward = darker/mellow, outward = brighter with a little resonance.
   updateFilterSweep(tiltFactor) {
     if (!this.filter || !this.ctx) return;
 
-    // Base parameters for a balanced centered (0%) hand
-    let targetFrequency = 1200;
+    let targetFrequency = FILTER_CENTER_HZ;
     let targetQ = 0.7;
 
     if (tiltFactor < 0) {
-      // ---- INWARD TILT (Acoustic Warmth) ----
-      const intensity = Math.abs(tiltFactor); 
-      targetFrequency = 1200 - (intensity * 950);
-      targetQ = 0.7 + (intensity * 1.5); // Add a subtle woody, hollow resonance
-    } 
-    else if (tiltFactor > 0) {
-      // ---- OUTWARD TILT (EDM Filter Sweep) ----
-      targetFrequency = 1200 + (tiltFactor * 3800);
-      targetQ = 0.7 + (tiltFactor * 4.5); // Spikes resonance for synthetic "squelch"
+      const intensity = Math.abs(tiltFactor);
+      targetFrequency = FILTER_CENTER_HZ * Math.pow(FILTER_MIN_HZ / FILTER_CENTER_HZ, intensity);
+      targetQ = 0.7 + intensity * 1.0;
+    } else if (tiltFactor > 0) {
+      targetFrequency = FILTER_CENTER_HZ * Math.pow(FILTER_MAX_HZ / FILTER_CENTER_HZ, tiltFactor);
+      targetQ = 0.7 + tiltFactor * 2.5;
     }
 
-    // Smooth out audio node updates frame-by-frame to eliminate audio clicking
     const now = this.ctx.currentTime;
     this.filter.frequency.setTargetAtTime(targetFrequency, now, 0.04);
     this.filter.Q.setTargetAtTime(targetQ, now, 0.04);
   }
 
   playNotes(freqs) {
-    if (!this.ctx || freqs.length === 0) return;
+    if (!this.player || freqs.length === 0) return;
 
     if (!hasPlayedFirstSound) {
       hasPlayedFirstSound = true;
       trackClarityEvent("first_sound");
     }
 
-    const key = freqs.map((f) => f.toFixed(1)).join(",");
+    const midi = [...new Set(freqs.map(freqToMidi))];
+    const key = midi.join(",");
     if (key === this.currentKey) return;
 
-    this.oscillators.forEach((osc) => { try { osc.stop(); } catch {} });
-    this.oscillators = freqs.map((freq) => {
-      const osc = this.ctx.createOscillator();
-      osc.type = currentWaveform;
-      osc.frequency.value = freq;
-      osc.connect(this.waveShaper); // was: this.filter
-      osc.start();
-      return osc;
-    });
+    // Release the old chord (its tail rings out) and strike the new one.
+    this.heldNotes.forEach((n) => this.player.noteOff(MIDI_CHANNEL, n));
+    midi.forEach((n) => this.player.noteOn(MIDI_CHANNEL, n, NOTE_VELOCITY));
+    this.heldNotes = midi;
     this.currentKey = key;
   }
 
   stop() {
     this.setVolume(0);
-    this.oscillators.forEach((osc) => {
-      try {
-        osc.stop();
-        osc.disconnect();
-      } catch {}
-    });
-    this.oscillators = [];
-    this.currentKey = null;
+    this.releaseNotes();
   }
 }
 
@@ -684,8 +705,22 @@ const synth = new SynthEngine();
 let hasPlayedFirstSound = false;
 let lastTrackedChord = null;
 
-startOverlayEl.addEventListener("click", () => {
-  synth.ensureContext();
+startOverlayEl.addEventListener("click", async () => {
+  if (startOverlayEl.dataset.loading) return;
+  startOverlayEl.dataset.loading = "1";
+  const label = startOverlayEl.querySelector(".start-text") || startOverlayEl;
+  const original = label.innerHTML;
+  label.textContent = "Loading instrument sounds…";
+  try {
+    await synth.ensureContext();
+  } catch (err) {
+    console.error(err);
+    label.textContent = "Could not load sounds. Reload to try again.";
+    delete startOverlayEl.dataset.loading;
+    synth.loading = null;
+    return;
+  }
+  label.innerHTML = original;
   startOverlayEl.style.display = "none";
   canvasEl.classList.remove("dimmed");
 });
